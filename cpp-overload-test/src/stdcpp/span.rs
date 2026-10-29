@@ -27,6 +27,12 @@ pub type T = std::ffi::c_int;
 /// `std::span<T, Extent>` has a second template parameter that can be a
 /// compile-time size or `std::dynamic_extent`; this wrapper always uses the
 /// latter.
+///
+/// FIXME: `StdSpan` needs a lifetime parameter so Rust can track how long the
+/// referenced memory remains valid. Forcing that memory to be `'static` would
+/// sidestep the problem, but it would also rule out ordinary borrowed data.
+/// The current `overload!` macro does not support the generic lifetimes needed
+/// to express this correctly.
 #[cfg_attr(not(test), expect(dead_code, reason = "Only used in tests"))]
 pub struct StdSpan(*mut c_void, PhantomData<T>);
 
@@ -56,6 +62,18 @@ impl StdSpan {
                 return new std::span<int>(ptr, len);
             })
         };
+
+        StdSpan(span, PhantomData)
+    }
+
+    /// Create a C++ `std::span<int>` from the half-open pointer range `[first, last)`.
+    fn from_pointers(first: *mut T, last: *mut T) -> StdSpan {
+        let span = unsafe {
+            cpp!([first as "int*", last as "int*"] -> *mut c_void as "std::span<int>*" {
+                return new std::span<int>(first, last);
+            })
+        };
+
         StdSpan(span, PhantomData)
     }
 
@@ -85,6 +103,7 @@ impl StdSpan {
 
     fn front(&self) -> Option<&T> {
         let span = self.0 as *const c_void;
+
         unsafe {
             cpp!([span as "const std::span<int>*"] -> Option<&T> as "const int*" {
                 // Calling front() on an empty span is undefined behaviour.
@@ -97,15 +116,18 @@ impl StdSpan {
     }
 }
 
-// Constructors: new() and new(&mut [T]).
-// Other common constructors (iterator range, C-array reference, etc.) are omitted for now.
+// Constructors covered: new(), new(&mut [T]), and new(*mut T, *mut T).
+// The slice overload corresponds to C++ constructor (2) on cppreference
+// (span(It first, size_type count)), which takes an iterator and element count.
+// The pointer-pair overload corresponds to C++ constructor (3)
+// (span(It first, End last)), which takes a start and end iterator.
+// Other constructors (e.g. C-array reference, initializer_list) are omitted for now.
 overload! {
     impl StdSpan {
         /// Construct an empty span.
         pub fn new() -> StdSpan {
             StdSpan::default()
         }
-
         /// Construct a span that points to the given mutable slice.
         ///
         /// The span does not own the data; the slice must outlive the span.
@@ -117,18 +139,42 @@ overload! {
         /// reference (`&` vs `&mut`). Passing a shared slice would require a
         /// read-only span, which this wrapper does not yet provide.
         ///
+        /// ### Ergonomics
+        ///
+        /// Even when the span is only used for reading, the caller must still
+        /// declare the array as mutable and pass a mutable slice.
+        ///
         /// ### Safety
         ///
         /// If the original array is dropped or mutated after the span is created,
         /// later use of the span is undefined behaviour: the span still points at
         /// memory that is no longer valid or that Rust assumes is exclusively owned.
-        /// FIXME: `StdSpan` needs a lifetime parameter to ensure the slice it
-        /// references stays valid for as long as the span is used. Making the
-        /// data `'static` would avoid this issue, but it would also prevent us
-        /// from using normal borrowed slices. The current `overload!` macro
-        /// doesn't support the generic lifetimes needed to fix this properly.
         pub fn new(items: &mut [T]) -> StdSpan {
             StdSpan::from_slice(items)
+        }
+
+        /// Construct a span from a half-open pointer range `[first, last)`.
+        ///
+        /// ### Limitations
+        ///
+        /// This overload takes raw pointers and ought to be marked `unsafe`.
+        /// The `overload!` macro currently drops that qualifier, so callers are
+        /// not forced to write an `unsafe` block. When the function was briefly
+        /// marked `pub unsafe fn`, the compiler still accepted call sites that
+        /// omitted `unsafe`, which is how the problem was discovered.
+        ///
+        /// ### Safety
+        ///
+        /// `first` and `last` must refer to the same contiguous array and
+        /// `first` must not come after `last`. The memory they describe has to
+        /// remain readable and writable for the whole time the span exists, and
+        /// no other code may touch it in a way that would conflict with the
+        /// span's access.
+        ///
+        /// FIXME: The `overload!` macro should keep `unsafe` on overloads so
+        /// callers have to acknowledge the raw-pointer contract.
+        pub fn new(first: *mut T, last: *mut T) -> StdSpan {
+            StdSpan::from_pointers(first, last)
         }
     }
 }
@@ -141,9 +187,18 @@ fn test_span() {
     assert_eq!(empty.size(), 0);
     assert!(empty.front().is_none());
 
+    // from a mutable slice
     let mut data = [10, 20, 30];
     let from_slice = StdSpan::new(&mut data);
 
     assert_eq!(from_slice.size(), 3);
     assert_eq!(from_slice.front(), Some(&10));
+
+    // from two raw pointers
+    let mut data = [10, 20, 30, 40];
+    let range = data.as_mut_ptr_range();
+    let from_ptrs = StdSpan::new(range.start, range.end);
+
+    assert_eq!(from_ptrs.size(), 4);
+    assert_eq!(from_ptrs.front(), Some(&10));
 }
