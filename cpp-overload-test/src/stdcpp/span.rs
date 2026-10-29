@@ -20,6 +20,13 @@ cpp! {{
 pub type T = std::ffi::c_int;
 
 /// A wrapper struct holding a pointer to a C++ `std::span<int>` object.
+///
+/// ### Limitations
+///
+/// Only the dynamic-extent form of `std::span` is supported. C++'s
+/// `std::span<T, Extent>` has a second template parameter that can be a
+/// compile-time size or `std::dynamic_extent`; this wrapper always uses the
+/// latter.
 #[cfg_attr(not(test), expect(dead_code, reason = "Only used in tests"))]
 pub struct StdSpan(*mut c_void, PhantomData<T>);
 
@@ -37,6 +44,18 @@ impl StdSpan {
             })
         };
 
+        StdSpan(span, PhantomData)
+    }
+
+    /// Create a C++ `std::span<int>` from a mutable slice.
+    fn from_slice(items: &mut [T]) -> StdSpan {
+        let len = items.len();
+        let ptr = items.as_mut_ptr();
+        let span = unsafe {
+            cpp!([ptr as "int*", len as "size_t"] -> *mut c_void as "std::span<int>*" {
+                return new std::span<int>(ptr, len);
+            })
+        };
         StdSpan(span, PhantomData)
     }
 
@@ -63,21 +82,68 @@ impl StdSpan {
         // Convert the `c_char` result back to a Rust `bool`.
         data_is_null != 0
     }
+
+    fn front(&self) -> Option<&T> {
+        let span = self.0 as *const c_void;
+        unsafe {
+            cpp!([span as "const std::span<int>*"] -> Option<&T> as "const int*" {
+                // Calling front() on an empty span is undefined behaviour.
+                if (span->empty()) {
+                    return nullptr;
+                }
+                return &span->front();
+            })
+        }
+    }
 }
 
+// Constructors: new() and new(&mut [T]).
+// Other common constructors (iterator range, C-array reference, etc.) are omitted for now.
 overload! {
     impl StdSpan {
         /// Construct an empty span.
         pub fn new() -> StdSpan {
             StdSpan::default()
         }
+
+        /// Construct a span that points to the given mutable slice.
+        ///
+        /// The span does not own the data; the slice must outlive the span.
+        ///
+        /// ### Limitations
+        ///
+        /// A plain `&[T]` cannot be used. C++ puts constness in the element type
+        /// (`std::span<const int>` vs `std::span<int>`), while Rust puts it on the
+        /// reference (`&` vs `&mut`). Passing a shared slice would require a
+        /// read-only span, which this wrapper does not yet provide.
+        ///
+        /// ### Safety
+        ///
+        /// If the original array is dropped or mutated after the span is created,
+        /// later use of the span is undefined behaviour: the span still points at
+        /// memory that is no longer valid or that Rust assumes is exclusively owned.
+        /// FIXME: `StdSpan` needs a lifetime parameter to ensure the slice it
+        /// references stays valid for as long as the span is used. Making the
+        /// data `'static` would avoid this issue, but it would also prevent us
+        /// from using normal borrowed slices. The current `overload!` macro
+        /// doesn't support the generic lifetimes needed to fix this properly.
+        pub fn new(items: &mut [T]) -> StdSpan {
+            StdSpan::from_slice(items)
+        }
     }
 }
 
 #[test]
 fn test_span() {
-    let span = StdSpan::new();
+    // default / empty
+    let empty = StdSpan::new();
+    assert!(empty.data_is_null());
+    assert_eq!(empty.size(), 0);
+    assert!(empty.front().is_none());
 
-    assert_eq!(span.size(), 0);
-    assert!(span.data_is_null());
+    let mut data = [10, 20, 30];
+    let from_slice = StdSpan::new(&mut data);
+
+    assert_eq!(from_slice.size(), 3);
+    assert_eq!(from_slice.front(), Some(&10));
 }
